@@ -98,7 +98,7 @@ class MagicStripDevice:
         await new_device.refresh_state()
         return new_device
 
-    def __init__(self, name: str, address: str, rssi: int):
+    def __init__(self, address: str, name: str, rssi: int | None = None):
         """MagicStripDevice."""
         self.name = name
         self.address = address
