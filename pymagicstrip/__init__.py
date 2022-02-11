@@ -65,11 +65,6 @@ class MagicStripHub:
 
         return self._known_devices
 
-    def get_effects_list(self) -> list:
-        """Get list of effects."""
-
-        return list(EFFECTS)
-
     async def discover(self) -> list[MagicStripDevice]:
         """Search for undiscovered devices."""
 
@@ -259,6 +254,12 @@ class MagicStripDevice:
     def effect_speed(self) -> int | None:
         """Return current effect speed."""
         return self._effect_speed
+
+    @property
+    def effects_list(self) -> list:
+        """Get list of effects."""
+
+        return list(EFFECTS)
 
     async def _send_command(self, cmd: str | list, attempts: int = 1) -> None:
         """Send given command."""
