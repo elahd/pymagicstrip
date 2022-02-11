@@ -13,7 +13,7 @@ from bleak import BleakClient, BleakScanner
 from bleak.exc import BleakError
 
 from . import const
-from .const import CHARACTERISTIC_UUID, EFFECTS
+from .const import CHARACTERISTIC_UUID, EFFECTS, TOGGLE_POWER
 from .errors import BleConnectionError, BleTimeoutError, OutOfRange
 
 __version__ = "0.1.0"
@@ -341,3 +341,8 @@ class MagicStripDevice:
         speed_cmd = f"09{speed:02x}"
 
         await self._send_command([effect_cmd, speed_cmd])
+
+    async def toggle_power(self) -> None:
+        """Set strip to specified effect."""
+
+        await self._send_command(TOGGLE_POWER)
