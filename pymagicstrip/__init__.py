@@ -1,33 +1,51 @@
 """Hub for communicating with pymagicstrip devices."""
 
 # https://github.com/elupus/fjaraskupan/blob/master/src/fjaraskupan/__init__.py
+# https://github.com/home-assistant/core/blob/dev/homeassistant/components/fjaraskupan/__init__.py
 
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta
 import logging
 import re
-
+from dataclasses import dataclass, replace
+from typing import Any
 from bleak import BleakClient, BleakScanner
 from bleak.exc import BleakError
+from bleak.backends.device import BLEDevice
+from bleak.backends.scanner import AdvertisementData
 
 from . import const
-from .const import CHARACTERISTIC_UUID, EFFECTS, TOGGLE_POWER
+from .const import CHARACTERISTIC_UUID, CMD_ACK, EFFECTS, TOGGLE_POWER
 from .errors import BleConnectionError, BleTimeoutError, OutOfRange
 
 __version__ = "0.1.0"
 
 _LOGGER = logging.getLogger(__name__)
-handler = logging.StreamHandler()
-formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-handler.setFormatter(formatter)
-_LOGGER.addHandler(handler)
 _LOGGER.setLevel(logging.DEBUG)
 
+# handler = logging.StreamHandler()
+# formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+# handler.setFormatter(formatter)
+# _LOGGER.addHandler(handler)
 
-def _judge_rssi(rssi: int) -> str | None:
+
+def device_filter(device: BLEDevice, advertisement_data: AdvertisementData) -> bool:
+    """Bleak discovery notification device filter."""
+
+    if device.name.lower() in [
+        d.lower() for d in const.HARDCODED_NAMES
+    ] and const.SERVICE_UUID in device.metadata.get("uuids", []):
+        return True
+
+    return False
+
+
+def _judge_rssi(rssi: int | None) -> str | None:
     """Return qualatative assessment of RSSI."""
+
+    if rssi is None:
+        return None
 
     if rssi >= 0:
         return "Unknown"
@@ -88,40 +106,48 @@ class MagicStripHub:
         return self._known_devices
 
 
-class MagicStripDevice:
+@dataclass(frozen=True)
+class MagicStripState:
     """Device class."""
 
-    @classmethod
-    async def create(cls, name: str, address: str, rssi: int) -> MagicStripDevice:
-        """Magicstripdevice factory. Required to allow use of async functions immediately upon creation."""
-        new_device = MagicStripDevice(name, address, rssi)
-        await new_device.refresh_state()
-        return new_device
+    on: bool | None = None
+    brightness: int | None = None
+    color: tuple[int, int, int] | None = None
+    effect: str | None = None
+    effect_speed: int | None = None
+    rssi: int | None = None
+    event = asyncio.Event()
 
-    def __init__(self, address: str, name: str, rssi: int | None = None):
-        """MagicStripDevice."""
-        self.name = name
-        self.address = address
-        self.rssi = rssi
-        self._on: bool | None = None
-        self._brightness: int | None = None
-        self._color: tuple[int, int, int] | None = None
-        self._effect: str | None = None
-        self._effect_speed: int | None = None
+    def replace_from_notification(
+        self, on: bool, brightness: int, **changes: Any
+    ) -> MagicStripState:
+        """Update state based on device notification."""
 
-        self._power_status_millis: datetime | None = None
+        return replace(self, on=on, brightness=brightness, **changes)
 
+    @property
+    def connection_quality(self) -> str:
+        """Get connection quality."""
+
+        return _judge_rssi(self.rssi)
+
+    @property
+    def effects_list(self) -> list[str]:
+        """Get list of effects."""
+
+        return list(EFFECTS)
+
+
+class MagicStripDevice:
+    """Communication handler."""
+
+    def __init__(self, device: BLEDevice | str) -> None:
+        """Initialize handler."""
+        self.ble_device = device
+        self.state = MagicStripState()
         self.lock = asyncio.Lock()
-        self._client = BleakClient(self.address)
+        self._client = BleakClient(self.ble_device)
         self._client_count = 0
-
-        _LOGGER.info(
-            "Found %s (%s), Signal Strength: %s (%s)",
-            self.name,
-            self.address,
-            _judge_rssi(self.rssi),
-            self.rssi,
-        )
 
     async def __aenter__(self) -> MagicStripDevice:
         """Enter context."""
@@ -129,12 +155,15 @@ class MagicStripDevice:
             if self._client_count == 0:
                 try:
                     await self._client.__aenter__()
-                except asyncio.TimeoutError as exc:
+                except (asyncio.TimeoutError, asyncio.exceptions.TimeoutError) as exc:
                     _LOGGER.debug("Timeout on connect", exc_info=True)
-                    raise BleConnectionError("Timeout on connect") from exc
+                    raise BleTimeoutError("Timeout on connect") from exc
+                except asyncio.CancelledError as exc:
+                    _LOGGER.debug("Connection cancelled", exc_info=True)
+                    raise BleTimeoutError("Connection cancelled") from exc
                 except BleakError as exc:
                     _LOGGER.debug("Error on connect", exc_info=True)
-                    raise BleTimeoutError("Error on connect") from exc
+                    raise BleConnectionError("Error on connect") from exc
             self._client_count += 1
             return self
 
@@ -145,7 +174,7 @@ class MagicStripDevice:
             if self._client_count == 0:
                 await self._client.__aexit__(exc_type, exc_val, exc_tb)
 
-    def _onoff_notification_handler(self, sender, data) -> None:  # type: ignore
+    async def _onoff_notification_handler(self, sender, data) -> None:  # type: ignore
         """Handle HCI event notifications."""
 
         """
@@ -164,102 +193,41 @@ class MagicStripDevice:
         ZZ useless.
         """
 
-        if self._power_status_millis and (
-            (datetime.now() - self._power_status_millis) > timedelta(seconds=10)
-        ):
-            _LOGGER.debug(
-                "%s: Message received outside of acceptable time range. Ignoring.",
-                self.address,
-            )
-            self._power_status_millis = None
-            return
-
-        if bytearray.hex(data) == const.CMD_ACK:
-            # Prepare to receive on/off status
-            _LOGGER.debug(
-                "%s: Received status message preamble. Waiting for status message...",
-                self.address,
-            )
-            self._power_status_millis = datetime.now()
-            return
-
         status_components: re.Match | None
         if (
-            status_components := re.search(const.STATUS_REGEX, bytearray.hex(data))
+            status_components := re.search(
+                const.STATUS_REGEX, status_str := bytearray.hex(data)
+            )
         ) is not None:
 
-            self._on = status_components.group(1) == "01"
-            self._brightness = int(status_components.group(2), 16)
+            on = status_components.group(1) == "01"
+            brightness = int(status_components.group(2), 16)
+
+            self.state = self.state.replace_from_notification(
+                on=on, brightness=brightness
+            )
 
             _LOGGER.debug(
                 "%s: Device status reported as %s. On: %s, Brightness: %s",
                 self.address,
                 bytearray.hex(data),
-                self._on,
-                self._brightness,
+                on,
+                brightness,
             )
 
-    async def refresh_state(self) -> None:
-        """Query device for current power and brightness states."""
+            _LOGGER.debug("New state: %s", str(self.state))
 
-        _LOGGER.debug("Refreshing state.")
-
-        async with self:
-            async with self.lock:
-                try:
-                    _LOGGER.debug("%s: Connected", self.address)
-
-                    await self._client.start_notify(
-                        CHARACTERISTIC_UUID, self._onoff_notification_handler
-                    )
-
-                    await self._client.write_gatt_char(
-                        CHARACTERISTIC_UUID, bytes.fromhex("F0"), True
-                    )
-                    await self._client.write_gatt_char(
-                        CHARACTERISTIC_UUID, bytes.fromhex("0F")
-                    )
-
-                    # await self._client.write_gatt_descriptor(4, bytes.fromhex("0100"))
-
-                    await self._client.stop_notify(CHARACTERISTIC_UUID)
-                except asyncio.TimeoutError as exc:
-                    _LOGGER.debug("Timeout on update", exc_info=True)
-                    raise BleTimeoutError from exc
-                except BleakError as exc:
-                    _LOGGER.debug("Failed to update", exc_info=True)
-                    raise BleConnectionError("Failed to update device") from exc
+        elif status_str == CMD_ACK:
+            _LOGGER.debug("Got status ack.")
+        else:
+            _LOGGER.debug("Invalid status message: %s", status_str)
 
     @property
-    def brightness(self) -> int | None:
-        """Return current brightness."""
-        return self._brightness
-
-    @property
-    def is_on(self) -> bool | None:
-        """Return current brightness."""
-        return self._on
-
-    @property
-    def color(self) -> tuple[int, int, int] | None:
-        """Return current color."""
-        return self._color
-
-    @property
-    def effect(self) -> str | None:
-        """Return current effect."""
-        return self._effect
-
-    @property
-    def effect_speed(self) -> int | None:
-        """Return current effect speed."""
-        return self._effect_speed
-
-    @property
-    def effects_list(self) -> list:
-        """Get list of effects."""
-
-        return list(EFFECTS)
+    def address(self) -> str:
+        """Return address of the device."""
+        if isinstance(self.ble_device, str):
+            return self.ble_device
+        return str(self.ble_device.address)
 
     async def _send_command(self, cmd: str | list, attempts: int = 1) -> None:
         """Send given command."""
@@ -311,11 +279,11 @@ class MagicStripDevice:
             if not 0 <= color <= 255:
                 raise OutOfRange
 
-        self._color = (red, green, blue)
-        self._effect_speed = None
-        self._effect = None
+        await self._send_command(f"03{''.join(f'{i:02x}' for i in self.state.color)}")
 
-        await self._send_command(f"03{''.join(f'{i:02x}' for i in self._color)}")
+        self.state = replace(
+            self.state, color=(red, green, blue), effect_speed=None, effect=None
+        )
 
     async def set_brightness(self, brightness: int) -> None:
         """Set strip to specified brightness; no effects."""
@@ -323,26 +291,78 @@ class MagicStripDevice:
         if not 0 <= brightness <= 255:
             raise OutOfRange
 
-        self._brightness = brightness
-
         await self._send_command(f"08{''.join(f'{brightness:02x}')}")
 
-    async def set_effect(self, effect: str, speed: int = 128) -> None:
+        self.state = replace(self.state, brightness=brightness)
+
+    async def set_effect_name(self, effect: str | None) -> None:
         """Set strip to specified effect."""
 
-        if (not 0 <= speed <= 255) or (effect not in list(EFFECTS)):
+        if effect not in (list(EFFECTS) + [None]):
             raise OutOfRange
 
-        self._effect_speed = speed
-        self._effect = effect
-        self._color = None
+        if effect is not None:
+            effect_cmd = EFFECTS[effect]
+            await self._send_command(effect_cmd)
 
-        effect_cmd = EFFECTS[effect]
+        self.state = replace(self.state, effect=effect, color=None)
+
+    async def set_effect_speed(self, speed: int) -> None:
+        """Set strip to specified effect."""
+
+        if not 0 <= speed <= 255:
+            raise OutOfRange
+
         speed_cmd = f"09{speed:02x}"
+        await self._send_command(speed_cmd)
 
-        await self._send_command([effect_cmd, speed_cmd])
+        self.state = replace(self.state, effect_speed=speed)
 
     async def toggle_power(self) -> None:
         """Set strip to specified effect."""
-
         await self._send_command(TOGGLE_POWER)
+
+        self.state = replace(self.state, on=not self.state.on)
+
+    async def detection_callback(
+        self, device: BLEDevice, advertisement_data: AdvertisementData
+    ) -> None:
+        """Handle scanner data."""
+
+        self.state = replace(self.state, rssi=device.rssi)
+
+        _LOGGER.debug("Discovered Device: %s", self.state)
+
+        await self.update()
+
+    async def update(self) -> None:
+        """Query device for current power and brightness states."""
+
+        _LOGGER.debug("Refreshing state.")
+
+        async with self:
+            async with self.lock:
+                try:
+                    await self._client.start_notify(
+                        CHARACTERISTIC_UUID, self._onoff_notification_handler
+                    )
+
+                    await self._client.write_gatt_char(
+                        CHARACTERISTIC_UUID, bytes.fromhex("F0")
+                    )
+                    await self._client.write_gatt_char(
+                        CHARACTERISTIC_UUID, bytes.fromhex("0F")
+                    )
+
+                    # await self._client.write_gatt_descriptor(4, bytes.fromhex("0100"))
+
+                    # Give response notification time to come in.
+                    await asyncio.sleep(1)
+
+                    await self._client.stop_notify(CHARACTERISTIC_UUID)
+                except asyncio.TimeoutError as exc:
+                    _LOGGER.debug("Timeout on update", exc_info=True)
+                    raise BleTimeoutError from exc
+                except BleakError as exc:
+                    _LOGGER.debug("Failed to update", exc_info=True)
+                    raise BleConnectionError("Failed to update device") from exc
