@@ -1,8 +1,5 @@
 """Hub for communicating with pymagicstrip devices."""
 
-# https://github.com/elupus/fjaraskupan/blob/master/src/fjaraskupan/__init__.py
-# https://github.com/home-assistant/core/blob/dev/homeassistant/components/fjaraskupan/__init__.py
-
 from __future__ import annotations
 
 import asyncio
