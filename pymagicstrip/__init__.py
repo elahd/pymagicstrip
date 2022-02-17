@@ -263,6 +263,8 @@ class MagicStripDevice:
                     else:
                         raise
 
+        _LOGGER.debug("Command sent.")
+
     async def set_color(self, red: int, green: int, blue: int) -> None:
         """Set strip to specified color; no effects."""
 
@@ -279,7 +281,7 @@ class MagicStripDevice:
             if not 0 <= color <= 255:
                 raise OutOfRange
 
-        await self._send_command(f"03{''.join(f'{i:02x}' for i in self.state.color)}")
+        await self._send_command(f"03{''.join(f'{i:02x}' for i in (red, green, blue))}")
 
         self.state = replace(
             self.state, color=(red, green, blue), effect_speed=None, effect=None
@@ -294,6 +296,8 @@ class MagicStripDevice:
         await self._send_command(f"08{''.join(f'{brightness:02x}')}")
 
         self.state = replace(self.state, brightness=brightness)
+        
+        await self.update()
 
     async def set_effect_name(self, effect: str | None) -> None:
         """Set strip to specified effect."""
@@ -313,16 +317,24 @@ class MagicStripDevice:
         if not 0 <= speed <= 255:
             raise OutOfRange
 
-        speed_cmd = f"09{speed:02x}"
-        await self._send_command(speed_cmd)
+        # Speed is inverted. 0 is fastest; 255 is slowest. Let's keep that to ourselves.
+        inv_speed = (255 - speed)
 
+        speed_cmd = f"09{inv_speed:02x}"
+        
         self.state = replace(self.state, effect_speed=speed)
+        
+        await self._send_command(speed_cmd)
+        
+        _LOGGER.debug("New state: %s", self.state)
 
     async def toggle_power(self) -> None:
         """Set strip to specified effect."""
         await self._send_command(TOGGLE_POWER)
 
         self.state = replace(self.state, on=not self.state.on)
+        
+        await self.update()
 
     async def detection_callback(
         self, device: BLEDevice, advertisement_data: AdvertisementData
