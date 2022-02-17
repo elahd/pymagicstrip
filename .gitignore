@@ -129,3 +129,5 @@ dmypy.json
 .pyre/
 
 *.ignore.*
+tests.local/
+.mypy_cache/

@@ -6,14 +6,15 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass, replace
 import logging
 import re
-from dataclasses import dataclass, replace
 from typing import Any
-from bleak import BleakClient, BleakScanner
-from bleak.exc import BleakError
+
+from bleak import BleakClient
 from bleak.backends.device import BLEDevice
 from bleak.backends.scanner import AdvertisementData
+from bleak.exc import BleakError
 
 from . import const
 from .const import CHARACTERISTIC_UUID, CMD_ACK, EFFECTS, TOGGLE_POWER
@@ -61,51 +62,6 @@ def _judge_rssi(rssi: int | None) -> str | None:
     return None
 
 
-class MagicStripHub:
-    """Controller class."""
-
-    def __init__(self) -> None:
-        """Initialize hub."""
-        self._known_devices: list = []
-
-    async def add_known_devices(self, addresses: list[str]) -> list[MagicStripDevice]:
-        """Add known devices from a list of addresses."""
-
-        for address in addresses:
-            device = await BleakScanner.find_device_by_address(address)
-
-            if device:
-                self._known_devices.append(
-                    await MagicStripDevice.create(
-                        device.name, device.address, device.rssi
-                    )
-                )
-
-        return self._known_devices
-
-    async def discover(self) -> list[MagicStripDevice]:
-        """Search for undiscovered devices."""
-
-        devices = await BleakScanner.discover()
-
-        if len(devices) == 0:
-            return []
-
-        for device in devices:
-            if (
-                device.name
-                and device.name.lower() in [d.lower() for d in const.HARDCODED_NAMES]
-                and const.SERVICE_UUID in device.metadata.get("uuids", [])
-            ):
-                self._known_devices.append(
-                    await MagicStripDevice.create(
-                        device.name, device.address, device.rssi
-                    )
-                )
-
-        return self._known_devices
-
-
 @dataclass(frozen=True)
 class MagicStripState:
     """Device class."""
@@ -126,7 +82,7 @@ class MagicStripState:
         return replace(self, on=on, brightness=brightness, **changes)
 
     @property
-    def connection_quality(self) -> str:
+    def connection_quality(self) -> str | None:
         """Get connection quality."""
 
         return _judge_rssi(self.rssi)
@@ -296,13 +252,13 @@ class MagicStripDevice:
         await self._send_command(f"08{''.join(f'{brightness:02x}')}")
 
         self.state = replace(self.state, brightness=brightness)
-        
+
         await self.update()
 
     async def set_effect_name(self, effect: str | None) -> None:
         """Set strip to specified effect."""
 
-        if effect not in (list(EFFECTS) + [None]):
+        if effect not in list(EFFECTS) and effect is not None:
             raise OutOfRange
 
         if effect is not None:
@@ -318,14 +274,14 @@ class MagicStripDevice:
             raise OutOfRange
 
         # Speed is inverted. 0 is fastest; 255 is slowest. Let's keep that to ourselves.
-        inv_speed = (255 - speed)
+        inv_speed = 255 - speed
 
         speed_cmd = f"09{inv_speed:02x}"
-        
+
         self.state = replace(self.state, effect_speed=speed)
-        
+
         await self._send_command(speed_cmd)
-        
+
         _LOGGER.debug("New state: %s", self.state)
 
     async def toggle_power(self) -> None:
@@ -333,7 +289,7 @@ class MagicStripDevice:
         await self._send_command(TOGGLE_POWER)
 
         self.state = replace(self.state, on=not self.state.on)
-        
+
         await self.update()
 
     async def detection_callback(
